@@ -49,6 +49,9 @@ pub struct MultiuserXtraInstance {
     pub connection_mode: MultiuserConnectionMode,
     pub sender_id: String,
     pub recv_buffer: Vec<u8>,
+    /// Native (headless) conformance harness: bytes the client has sent via
+    /// `sendNetMessage`, captured in place of a real socket. Unused on wasm.
+    pub captured_out: std::collections::VecDeque<Vec<u8>>,
 }
 
 impl MultiuserXtraInstance {
@@ -121,6 +124,7 @@ impl MultiuserXtraManager {
                 connection_mode: MultiuserConnectionMode::Binary,
                 sender_id: String::new(),
                 recv_buffer: Vec::new(),
+                captured_out: std::collections::VecDeque::new(),
             },
         );
         self.instance_counter
@@ -224,6 +228,22 @@ impl MultiuserXtraManager {
                     }
                 })?;
 
+                instance.sender_id = username.clone();
+                instance.connection_mode = MultiuserConnectionMode::from_i32(mode)
+                    .ok_or_else(|| ScriptError::new(format!("Invalid connection mode: {}", mode)))?;
+
+                // Native (headless) builds have no browser WebSocket. Wire an
+                // in-process mock the conformance harness drives: sendNetMessage
+                // captures C->S bytes; the harness injects S->C via the manager.
+                // (bobba habbo-oracle)
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = (&username, &password, &host, &port, &movie_id, &encryption_key);
+                    return Ok(DatumRef::Void);
+                }
+
+                #[cfg(target_arch = "wasm32")]
+                {
                 let window_secure = web_sys::window()
                     .and_then(|w| w.location().protocol().ok())
                     .map_or(false, |p| p == "https:");
@@ -281,13 +301,6 @@ impl MultiuserXtraManager {
                     }
                 };
                 multiuser_log!("Multiuser: Connecting to WebSocket URL: {} (original={}:{}, user={}, movie={})", ws_url, host, port, username, movie_id);
-
-                instance.sender_id = username.clone();
-                instance.connection_mode = if let Some(mode) = MultiuserConnectionMode::from_i32(mode) {
-                    mode
-                } else {
-                    return Err(ScriptError::new(format!("Invalid connection mode: {}", mode)));
-                };
 
                 let socket = match WebSocket::new(&ws_url) {
                     Ok(s) => s,
@@ -469,6 +482,7 @@ impl MultiuserXtraManager {
                 onerror_callback.forget();
                 onclose_callback.forget();
                 onopen_callback.forget();
+                }
 
                 Ok(DatumRef::Void)
             }
@@ -522,39 +536,48 @@ impl MultiuserXtraManager {
                 let mut multiusr_manager = unsafe { MULTIUSER_XTRA_MANAGER_OPT.as_mut().unwrap() };
                 let instance = multiusr_manager.instances.get_mut(&instance_id).unwrap();
                 reserve_player_mut(|player| {
-                    // multiuser_log!("sendNetMessage: {:?}", msg_string);
-                    if let Some(tx) = &instance.socket_tx {
-                        let msg_bytes = match instance.connection_mode {
-                            MultiuserConnectionMode::Text => {
-                                let msg_data = player.get_datum(args.get(2).unwrap());
-                                msg_data.string_value()?.chars().map(|c| c as u8).collect::<Vec<u8>>()
-                            }
-                            MultiuserConnectionMode::Binary => {
-                                let subject = player.get_datum(args.get(1).unwrap()).string_value()?;
-                                let msg_data = player.get_datum(args.get(2).unwrap());
-                                let content = StaticDatum::from(msg_data);
-                                let recipients_list = match player.get_datum(args.get(0).unwrap()) {
-                                    Datum::List(_, list, ..) => list.iter().map(|d| player.get_datum(d).string_value().unwrap_or_default()).collect_vec(),
-                                    Datum::String(s) => vec![s.clone()],
-                                    Datum::Int(0) => vec![],
-                                    _ => return Err(ScriptError::new("Invalid recipients argument, expected list or string".to_string())),
-                                };
+                    // Frame the message (transport-agnostic), then deliver it.
+                    let msg_bytes = match instance.connection_mode {
+                        MultiuserConnectionMode::Text => {
+                            let msg_data = player.get_datum(args.get(2).unwrap());
+                            msg_data.string_value()?.chars().map(|c| c as u8).collect::<Vec<u8>>()
+                        }
+                        MultiuserConnectionMode::Binary => {
+                            let subject = player.get_datum(args.get(1).unwrap()).string_value()?;
+                            let msg_data = player.get_datum(args.get(2).unwrap());
+                            let content = StaticDatum::from(msg_data);
+                            let recipients_list = match player.get_datum(args.get(0).unwrap()) {
+                                Datum::List(_, list, ..) => list.iter().map(|d| player.get_datum(d).string_value().unwrap_or_default()).collect_vec(),
+                                Datum::String(s) => vec![s.clone()],
+                                Datum::Int(0) => vec![],
+                                _ => return Err(ScriptError::new("Invalid recipients argument, expected list or string".to_string())),
+                            };
 
-                                let message = MultiuserMessage {
-                                    error_code: 0,
-                                    recipients: recipients_list,
-                                    sender_id: instance.sender_id.clone(),
-                                    subject,
-                                    content,
-                                    time_stamp: 0,
-                                };
-                                message.to_bytes(None)
-                            }
-                        };
-                        tx.try_send(msg_bytes).unwrap();
+                            let message = MultiuserMessage {
+                                error_code: 0,
+                                recipients: recipients_list,
+                                sender_id: instance.sender_id.clone(),
+                                subject,
+                                content,
+                                time_stamp: 0,
+                            };
+                            message.to_bytes(None)
+                        }
+                    };
+                    // wasm: send over the WebSocket channel; native: capture for the harness.
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        if let Some(tx) = &instance.socket_tx {
+                            tx.try_send(msg_bytes).unwrap();
+                            Ok(DatumRef::Void)
+                        } else {
+                            Err(ScriptError::new("Socket not connected".to_string()))
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        instance.captured_out.push_back(msg_bytes);
                         Ok(DatumRef::Void)
-                    } else {
-                        Err(ScriptError::new("Socket not connected".to_string()))
                     }
                 })
             }
@@ -621,6 +644,45 @@ impl MultiuserXtraManager {
                 "No handler {} found for Multiuser xtra instance #{}",
                 handler_name, instance_id
             ))),
+        }
+    }
+
+    /// Conformance-harness hook: inject a server->client message as raw bytes
+    /// (Text mode) into `instance_id`, firing the client's registered net-message
+    /// callback. Returns false if no such instance. (bobba habbo-oracle)
+    pub fn mock_inject(&mut self, instance_id: u32, bytes: Vec<u8>) -> bool {
+        if let Some(instance) = self.instances.get_mut(&instance_id) {
+            let content: String = bytes.into_iter().map(|b| b as char).collect();
+            instance.dispatch_message(MultiuserMessage {
+                error_code: 0,
+                recipients: vec!["*".to_string()],
+                sender_id: "System".to_string(),
+                subject: "String".to_string(),
+                content: StaticDatum::String(content),
+                time_stamp: 0,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Conformance-harness hook: drain the bytes the client has sent on
+    /// `instance_id` (captured in place of a real socket).
+    pub fn mock_take_sent(&mut self, instance_id: u32) -> Vec<Vec<u8>> {
+        self.instances
+            .get_mut(&instance_id)
+            .map(|i| i.captured_out.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Conformance-harness hook: id of the most-recently-created instance (the
+    /// game connection, for single-socket handshake tests). None if none exist.
+    pub fn mock_latest_instance(&self) -> Option<u32> {
+        if self.instance_counter == 0 {
+            None
+        } else {
+            Some(self.instance_counter)
         }
     }
 
