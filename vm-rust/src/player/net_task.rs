@@ -85,8 +85,18 @@ pub async fn fetch_net_task(
         task.id, task.url, resolved_url_str
     );
 
+    // Native (headless) builds have no browser `fetch`. Until the asset-provider
+    // seam lands, fail gracefully like the real client does when no asset server
+    // is reachable: it logs the download error and keeps going. (bobba habbo-oracle)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = &shared_state;
+        return Err(-1);
+    }
+
     // Normal HTTP(S) fetch
     // Note: file:// URLs are handled in preload_net_thing and never reach this function
+    #[allow(unreachable_code)]
     let window = web_sys::window().unwrap();
 
     let mut url_string = task.resolved_url.to_string();
