@@ -755,12 +755,18 @@ impl MovieHandlers {
     pub fn get_pref(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
         reserve_player_mut(|player| {
             let pref_name = player.get_datum(&args[0]).string_value()?;
-            let storage = web_sys::window()
-                .and_then(|w| w.local_storage().ok().flatten());
-            if let Some(storage) = storage {
-                let key = format!("dirplayer_pref_{}", pref_name);
-                if let Ok(Some(value)) = storage.get_item(&key) {
-                    return Ok(player.alloc_datum(Datum::String(value)));
+            let _ = &pref_name;
+            // Browser builds persist prefs to localStorage; native (headless) has
+            // no localStorage / JS global, so skip it (first-run = pref absent).
+            #[cfg(target_arch = "wasm32")]
+            {
+                let storage = web_sys::window()
+                    .and_then(|w| w.local_storage().ok().flatten());
+                if let Some(storage) = storage {
+                    let key = format!("dirplayer_pref_{}", pref_name);
+                    if let Ok(Some(value)) = storage.get_item(&key) {
+                        return Ok(player.alloc_datum(Datum::String(value)));
+                    }
                 }
             }
             Ok(DatumRef::Void)
@@ -771,11 +777,16 @@ impl MovieHandlers {
         reserve_player_mut(|player| {
             let pref_name = player.get_datum(&args[0]).string_value()?;
             let pref_value = player.get_datum(&args[1]).string_value()?;
-            let storage = web_sys::window()
-                .and_then(|w| w.local_storage().ok().flatten());
-            if let Some(storage) = storage {
-                let key = format!("dirplayer_pref_{}", pref_name);
-                let _ = storage.set_item(&key, &pref_value);
+            let _ = (&pref_name, &pref_value);
+            // Native (headless) has no localStorage; skip persistence.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let storage = web_sys::window()
+                    .and_then(|w| w.local_storage().ok().flatten());
+                if let Some(storage) = storage {
+                    let key = format!("dirplayer_pref_{}", pref_name);
+                    let _ = storage.set_item(&key, &pref_value);
+                }
             }
             Ok(DatumRef::Void)
         })
