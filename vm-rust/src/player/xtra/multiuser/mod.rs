@@ -653,7 +653,10 @@ impl MultiuserXtraManager {
     pub fn mock_inject(&mut self, instance_id: u32, bytes: Vec<u8>) -> bool {
         if let Some(instance) = self.instances.get_mut(&instance_id) {
             let content: String = bytes.into_iter().map(|b| b as char).collect();
-            instance.dispatch_message(MultiuserMessage {
+            // Queue the inbound message WITHOUT firing the spawn_local event loop
+            // (which isn't pumped under the native test harness). The harness
+            // drives delivery via `mock_dispatch_pending` instead.
+            instance.message_queue.push(MultiuserMessage {
                 error_code: 0,
                 recipients: vec!["*".to_string()],
                 sender_id: "System".to_string(),
@@ -697,6 +700,32 @@ impl MultiuserXtraManager {
 pub fn borrow_multiuser_manager_mut<T>(callback: impl FnOnce(&mut MultiuserXtraManager) -> T) -> T {
     let mut manager = unsafe { MULTIUSER_XTRA_MANAGER_OPT.as_mut().unwrap() };
     callback(&mut *manager)
+}
+
+/// Conformance-harness hook (native): deliver any queued inbound messages on
+/// `instance_id` by invoking the client's registered net-message callback once
+/// per message, in the caller's async context — the spawn_local event loop is
+/// not pumped under the native test harness. (bobba habbo-oracle)
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn mock_dispatch_pending(instance_id: u32) {
+    use crate::player::handlers::datum_handlers::player_call_datum_handler;
+    for _ in 0..64 {
+        let handler = borrow_multiuser_manager_mut(|m| {
+            m.instances.get(&instance_id).and_then(|i| {
+                if i.message_queue.is_empty() {
+                    None
+                } else {
+                    i.net_message_handler.clone()
+                }
+            })
+        });
+        match handler {
+            Some((receiver, symbol)) => {
+                let _ = player_call_datum_handler(&receiver, &symbol, &vec![]).await;
+            }
+            None => break,
+        }
+    }
 }
 
 // lazy_static! {
