@@ -2,6 +2,8 @@ pub mod blowfish;
 pub mod writer;
 pub mod reader;
 pub mod types;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod socket;
 
 use std::collections::VecDeque;
 use async_std::{channel::Sender, task::spawn_local};
@@ -27,6 +29,9 @@ use crate::{
     },
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::player::xtra::multiuser::socket::{MockNetSocket, NetSocket, NetSocketBackend, TcpNetSocket};
+
 #[derive(Debug, Clone, FromPrimitive)]
 pub enum MultiuserConnectionMode {
     Binary = 0,
@@ -49,9 +54,10 @@ pub struct MultiuserXtraInstance {
     pub connection_mode: MultiuserConnectionMode,
     pub sender_id: String,
     pub recv_buffer: Vec<u8>,
-    /// Native (headless) conformance harness: bytes the client has sent via
-    /// `sendNetMessage`, captured in place of a real socket. Unused on wasm.
-    pub captured_out: std::collections::VecDeque<Vec<u8>>,
+    /// Native transport backend (in-process mock or real TCP), selected at
+    /// connect time. On wasm the browser `WebSocket` is used via `socket_tx`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub socket: Option<NetSocketBackend>,
 }
 
 impl MultiuserXtraInstance {
@@ -110,6 +116,10 @@ impl MultiuserXtraInstance {
 pub struct MultiuserXtraManager {
     pub instances: FxHashMap<u32, MultiuserXtraInstance>,
     pub instance_counter: u32,
+    /// Native conformance harness: when set, `connectToNetServer` opens a real
+    /// TCP connection ([`TcpNetSocket`]) instead of the in-process mock.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use_tcp: bool,
 }
 
 impl MultiuserXtraManager {
@@ -124,7 +134,8 @@ impl MultiuserXtraManager {
                 connection_mode: MultiuserConnectionMode::Binary,
                 sender_id: String::new(),
                 recv_buffer: Vec::new(),
-                captured_out: std::collections::VecDeque::new(),
+                #[cfg(not(target_arch = "wasm32"))]
+                socket: None,
             },
         );
         self.instance_counter
@@ -172,6 +183,8 @@ impl MultiuserXtraManager {
             }
             "connecttonetserver" => {
                 let mut multiusr_manager = unsafe { MULTIUSER_XTRA_MANAGER_OPT.as_mut().unwrap() };
+                #[cfg(not(target_arch = "wasm32"))]
+                let use_tcp = multiusr_manager.use_tcp;
                 let instance = multiusr_manager.instances.get_mut(&instance_id).unwrap();
                 if let Some((handler_obj_ref, handler_symbol)) = &instance.net_message_handler {
                     let _handler_symbol = handler_symbol.clone();
@@ -238,7 +251,14 @@ impl MultiuserXtraManager {
                 // (bobba habbo-oracle)
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let _ = (&username, &password, &host, &port, &movie_id, &encryption_key);
+                    let _ = (&username, &password, &movie_id, &encryption_key);
+                    let mut backend = if use_tcp {
+                        NetSocketBackend::Tcp(TcpNetSocket::new())
+                    } else {
+                        NetSocketBackend::Mock(MockNetSocket::new())
+                    };
+                    backend.connect(&host, port)?;
+                    instance.socket = Some(backend);
                     return Ok(DatumRef::Void);
                 }
 
@@ -576,8 +596,13 @@ impl MultiuserXtraManager {
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     {
-                        instance.captured_out.push_back(msg_bytes);
-                        Ok(DatumRef::Void)
+                        match &mut instance.socket {
+                            Some(socket) => {
+                                socket.send(msg_bytes)?;
+                                Ok(DatumRef::Void)
+                            }
+                            None => Err(ScriptError::new("Socket not connected".to_string())),
+                        }
                     }
                 })
             }
@@ -672,10 +697,14 @@ impl MultiuserXtraManager {
 
     /// Conformance-harness hook: drain the bytes the client has sent on
     /// `instance_id` (captured in place of a real socket).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn mock_take_sent(&mut self, instance_id: u32) -> Vec<Vec<u8>> {
         self.instances
             .get_mut(&instance_id)
-            .map(|i| i.captured_out.drain(..).collect())
+            .and_then(|i| match &mut i.socket {
+                Some(NetSocketBackend::Mock(mock)) => Some(mock.take_sent()),
+                _ => None,
+            })
             .unwrap_or_default()
     }
 
@@ -693,6 +722,8 @@ impl MultiuserXtraManager {
         MultiuserXtraManager {
             instances: FxHashMap::default(),
             instance_counter: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            use_tcp: false,
         }
     }
 }
@@ -726,6 +757,67 @@ pub async fn mock_dispatch_pending(instance_id: u32) {
             None => break,
         }
     }
+}
+
+/// Conformance-harness control (native): choose the transport
+/// `connectToNetServer` opens for subsequent connections — real TCP when `true`,
+/// the in-process mock when `false` (the default). (bobba habbo-oracle)
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_tcp_transport(use_tcp: bool) {
+    borrow_multiuser_manager_mut(|manager| manager.use_tcp = use_tcp);
+}
+
+/// Conformance-harness hook (native): pump a TCP-backed instance once — connect
+/// if needed, flush the client's queued sends to the socket, read one batch of
+/// reply bytes, queue them as a raw (Text-mode) inbound message, and dispatch the
+/// client's net-message callback. Awaited by the harness; the socket I/O runs on
+/// an owned stream so no manager borrow is held across an `.await`.
+/// (bobba habbo-oracle)
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn tcp_pump(instance_id: u32) -> Result<usize, String> {
+    // Take the stream + queued sends out of the backend under a short borrow, so
+    // the socket I/O below holds no borrow of the global manager across `.await`.
+    let prepared = borrow_multiuser_manager_mut(|manager| {
+        manager.instances.get_mut(&instance_id).and_then(|instance| {
+            match &mut instance.socket {
+                Some(NetSocketBackend::Tcp(tcp)) => {
+                    let (host, port) = tcp.target();
+                    Some((tcp.take_stream(), host, port, tcp.take_outbound()))
+                }
+                _ => None,
+            }
+        })
+    });
+    let Some((mut stream, host, port, outbound)) = prepared else {
+        return Ok(0); // not a TCP-backed instance; nothing to pump
+    };
+
+    let received = TcpNetSocket::drive(&mut stream, &host, port, outbound)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    borrow_multiuser_manager_mut(|manager| {
+        if let Some(instance) = manager.instances.get_mut(&instance_id) {
+            if let Some(NetSocketBackend::Tcp(tcp)) = &mut instance.socket {
+                tcp.restore_stream(stream);
+            }
+            if !received.is_empty() {
+                let content: String = received.iter().map(|&b| b as char).collect();
+                instance.message_queue.push(MultiuserMessage {
+                    error_code: 0,
+                    recipients: vec!["*".to_string()],
+                    sender_id: "System".to_string(),
+                    subject: "String".to_string(),
+                    content: StaticDatum::String(content),
+                    time_stamp: 0,
+                });
+            }
+        }
+    });
+
+    let received_len = received.len();
+    mock_dispatch_pending(instance_id).await;
+    Ok(received_len)
 }
 
 // lazy_static! {
