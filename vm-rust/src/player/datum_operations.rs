@@ -104,7 +104,7 @@ pub fn add_datums(left: Datum, right: Datum, player: &mut DirPlayer) -> Result<D
     match (&left, &right) {
         (Datum::Void, some) => Ok(some.clone()),
         (some, Datum::Void) => Ok(some.clone()),
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a + b)),
+        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a.wrapping_add(*b))),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a + b)),
         (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a + (*b as f64))),
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float((*a as f64) + b)),
@@ -287,7 +287,7 @@ pub fn subtract_datums(
 ) -> Result<Datum, ScriptError> {
     match (&left, &right) {
         (Datum::Void, Datum::Void) => Ok(Datum::Int(0)),
-        (Datum::Void, Datum::Int(r)) => Ok(Datum::Int(-r)),
+        (Datum::Void, Datum::Int(r)) => Ok(Datum::Int(r.wrapping_neg())),
         (Datum::Int(l), Datum::Void) => Ok(Datum::Int(*l)),
         (Datum::Void, Datum::Float(r)) => Ok(Datum::Float(-r)),
         (Datum::Float(l), Datum::Void) => Ok(Datum::Float(*l)),
@@ -463,7 +463,7 @@ pub fn multiply_datums(
         | (Datum::Void, Datum::Point(..)) => {
             Datum::Point([0.0, 0.0], 0)
         }
-        (Datum::Int(left), Datum::Int(right)) => Datum::Int(left * right),
+        (Datum::Int(left), Datum::Int(right)) => Datum::Int(left.wrapping_mul(*right)),
         (Datum::Int(left), Datum::Float(right)) => Datum::Float((*left as f64) * right),
         (Datum::Float(left), Datum::Int(right)) => Datum::Float(*left * (*right as f64)),
         (Datum::Float(left), Datum::Float(right)) => Datum::Float(left * right),
