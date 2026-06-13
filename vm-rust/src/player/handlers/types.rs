@@ -1174,7 +1174,14 @@ impl TypeHandlers {
 
             match (base, exponent) {
                 (Datum::Int(base), Datum::Int(exponent)) => {
-                    Ok(player.alloc_datum(Datum::Int(base.pow(*exponent as u32))))
+                    // Lingo's power() always yields a float — power(2, 31) is
+                    // 2147483648.0, beyond 32-bit int range — and the client
+                    // leans on that for its bit-shift helpers, e.g.
+                    // `bitshiftright = bitOr(x / power(2, n), 0)` with n up to 31.
+                    // Computing this in i32 (`i32::pow`) overflows and panics;
+                    // the float result truncates back through bitOr/int_value
+                    // exactly as Director does.
+                    Ok(player.alloc_datum(Datum::Float((*base as f64).powf(*exponent as f64))))
                 }
                 (Datum::Float(base), Datum::Float(exponent)) => {
                     Ok(player.alloc_datum(Datum::Float(base.powf(*exponent))))
