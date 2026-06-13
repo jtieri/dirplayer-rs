@@ -28,6 +28,13 @@ use async_std::net::TcpStream;
 
 use crate::player::ScriptError;
 
+/// Upper bound on how long [`TcpNetSocket::drive`] waits for a server reply
+/// before giving up. Generous on purpose: during the handshake the server
+/// answers each client send within microseconds on loopback, so this never
+/// trips in normal flow — it exists only so a stalled or misbehaving server
+/// fails the caller promptly instead of hanging indefinitely.
+const READ_BACKSTOP: Duration = Duration::from_secs(5);
+
 /// A transport backing the Multiuser Xtra's game socket on native targets.
 pub trait NetSocket {
     /// Record the server to connect to. Native connects are lazy — no I/O here.
@@ -128,13 +135,22 @@ impl TcpNetSocket {
         (self.host.clone(), self.port)
     }
 
-    /// Connect if needed, write every queued message, then read one batch of
-    /// reply bytes (bounded by a short timeout so a quiescent connection can't
-    /// hang the pump — the harness pumps repeatedly).
+    /// Connect if needed, write every queued message, then **block** until the
+    /// server responds and return that batch of reply bytes.
+    ///
+    /// The game protocol is strictly call-and-response during the handshake:
+    /// every read follows a client send the server is obliged to answer, so
+    /// waiting on the socket (rather than polling on a short timeout and making
+    /// the harness busy-spin) is the natural event-driven model. A quiescent
+    /// socket therefore means one of two things, both terminal: the server
+    /// closed after the final reply (surfaced as [`UnexpectedEof`]), or
+    /// something stalled — for which [`READ_BACKSTOP`] turns an otherwise
+    /// indefinite hang into a prompt error the caller can fail on.
     ///
     /// Operates on an owned `stream` + `outbound` so the caller holds no manager
-    /// borrow across an `.await`. Returns the bytes received this round (empty if
-    /// none arrived before the timeout).
+    /// borrow across an `.await`.
+    ///
+    /// [`UnexpectedEof`]: std::io::ErrorKind::UnexpectedEof
     pub async fn drive(
         stream: &mut Option<TcpStream>,
         host: &str,
@@ -156,14 +172,17 @@ impl TcpNetSocket {
         socket.flush().await?;
 
         let mut buf = [0u8; 8192];
-        match async_std::future::timeout(Duration::from_millis(100), socket.read(&mut buf)).await {
+        match async_std::future::timeout(READ_BACKSTOP, socket.read(&mut buf)).await {
             Ok(Ok(0)) => Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "server closed the connection",
             )),
             Ok(Ok(n)) => Ok(buf[..n].to_vec()),
             Ok(Err(e)) => Err(e),
-            Err(_timed_out) => Ok(Vec::new()),
+            Err(_timed_out) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no server response within the read backstop",
+            )),
         }
     }
 }

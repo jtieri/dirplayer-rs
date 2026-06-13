@@ -768,10 +768,13 @@ pub fn set_tcp_transport(use_tcp: bool) {
 }
 
 /// Conformance-harness hook (native): pump a TCP-backed instance once — connect
-/// if needed, flush the client's queued sends to the socket, read one batch of
-/// reply bytes, queue them as a raw (Text-mode) inbound message, and dispatch the
-/// client's net-message callback. Awaited by the harness; the socket I/O runs on
-/// an owned stream so no manager borrow is held across an `.await`.
+/// if needed, flush the client's queued sends to the socket, **block** for the
+/// server's reply (event-driven; see [`TcpNetSocket::drive`]), queue it as a raw
+/// (Text-mode) inbound message, and dispatch the client's net-message callback.
+/// Returns the number of reply bytes received, or `Err` when the connection
+/// closes (`UnexpectedEof`) or stalls past the read backstop — either of which
+/// tells the harness to stop pumping. Awaited by the harness; the socket I/O
+/// runs on an owned stream so no manager borrow is held across an `.await`.
 /// (bobba habbo-oracle)
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn tcp_pump(instance_id: u32) -> Result<usize, String> {
